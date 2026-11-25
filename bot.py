@@ -6,6 +6,7 @@ Setup:
     export DISCORD_TOKEN="your-bot-token"
     export CHANNEL_ID="123456789012345678"
     export HYPIXEL_KEY="optional-api-key"      # resource + bazaar endpoints work without one
+    export GUILD_ID="..."                      # optional, instant slash-command sync while testing
     python bot.py
 """
 
@@ -13,29 +14,29 @@ import asyncio
 import io
 import json
 import os
-import time
 import re
+import time
 
-from discord import app_commands
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import tasks
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
 API = "https://api.hypixel.net/v2"
-WIKI = "https://wiki.hypixel.net/api.php"
 SNAP_DIR = os.getenv("SNAP_DIR", "snapshots")
 POLL_MINUTES = 5
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 HYPIXEL_KEY = os.getenv("HYPIXEL_KEY", "")
+GUILD_ID = os.getenv("GUILD_ID")   # optional: sync slash commands instantly to one server
 
 # Bazaar spike alerts: a +1000% rise means the price is now 11x the baseline.
-BAZAAR_SPIKE_PCT = 900          # alert when buy price is up at least this much
-BAZAAR_WINDOW_HOURS = 48         # ...compared with the lowest price seen in this window
-BAZAAR_MIN_BASE_PRICE = 500.0      # ignore tiny/zero baselines (empty order books)
+BAZAAR_SPIKE_PCT = 1000          # alert when buy price is up at least this much
+BAZAAR_WINDOW_HOURS = 24         # ...compared with the lowest price seen in this window
+BAZAAR_MIN_BASE_PRICE = 1.0      # ignore tiny/zero baselines (empty order books)
 BAZAAR_SAMPLE_MINUTES = 30       # how often a price point is stored in the history
 
 
@@ -197,7 +198,7 @@ async def check_bazaar(session):
                 else:
                     alerted.discard(pid)  # price came back down: re-arm the alert
 
-        #   store a downsampled history so the snapshot file stays small
+        # store a downsampled history so the snapshot file stays small
         if price > 0 and (not points or now - points[-1][0] >= BAZAAR_SAMPLE_MINUTES * 60):
             points.append([now, price])
         if points:
@@ -332,8 +333,27 @@ CHECKS = [
 # ----------------------------------------------------------------------------
 # Discord bot
 # ----------------------------------------------------------------------------
-intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
+STARTED_AT = time.time()
+STATUS = {name: {"last_run": None, "last_ok": None, "failures": 0, "error": None}
+          for name, _ in CHECKS}
+
+
+class TrackerBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+        self.announced = False
+
+    async def setup_hook(self):
+        if GUILD_ID:  # guild sync is instant; global sync can take a while to appear
+            guild = discord.Object(id=int(GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+
+
+bot = TrackerBot()
 
 
 async def post(channel, msg):
@@ -358,10 +378,16 @@ async def poll():
         results = await asyncio.gather(*(fn(session) for _, fn in CHECKS),
                                        return_exceptions=True)
 
+    now = time.time()
     for (name, _), result in zip(CHECKS, results):
+        st = STATUS[name]
+        st["last_run"] = now
         if isinstance(result, Exception):
+            st["failures"] += 1
+            st["error"] = f"{type(result).__name__}: {result}"[:200]
             print(f"[{name}] check failed: {result!r}")
             continue
+        st["last_ok"], st["failures"], st["error"] = now, 0, None
         for msg in result:
             try:
                 await post(channel, msg)
@@ -375,6 +401,98 @@ async def before_poll():
     await bot.wait_until_ready()
 
 
+# ----------------------------------------------------------------------------
+# Slash commands
+# ----------------------------------------------------------------------------
+def ts(t, style="R"):
+    return f"<t:{int(t)}:{style}>" if t else "never"
+
+
+@bot.tree.command(name="status", description="Show the tracker's health and the current SkyBlock version")
+async def status_cmd(interaction: discord.Interaction):
+    version = load("items_version") or "unknown (not polled yet)"
+    broken = [n for n, st in STATUS.items() if st["failures"] >= 3]
+    healthy = sum(1 for st in STATUS.values() if st["last_ok"] and st["failures"] == 0)
+
+    embed = discord.Embed(
+        title="SkyBlock Tracker status",
+        color=discord.Color.red() if broken else discord.Color.green(),
+    )
+    embed.add_field(name="SkyBlock version", value=f"`{version}`", inline=True)
+    embed.add_field(name="Uptime", value=f"since {ts(STARTED_AT)}", inline=True)
+    nxt = poll.next_iteration
+    embed.add_field(name="Next poll", value=ts(nxt.timestamp()) if nxt else "n/a", inline=True)
+
+    lines = []
+    for name, st in STATUS.items():
+        if st["last_run"] is None:
+            icon, detail = "⏳", "not run yet"
+        elif st["failures"] == 0:
+            icon, detail = "✅", f"ok {ts(st['last_ok'])}"
+        else:
+            icon = "❌" if st["failures"] >= 3 else "⚠️"
+            detail = (f"{st['failures']} failure(s), last ok {ts(st['last_ok'])}\n"
+                      f"　`{st['error']}`")
+        lines.append(f"{icon} **{name}** — {detail}")
+    embed.add_field(name=f"Checkers ({healthy}/{len(STATUS)} healthy)",
+                    value="\n".join(lines)[:1024], inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+_mayor_cache = {"t": 0, "data": None}
+
+
+async def fetch_election():
+    if _mayor_cache["data"] and time.time() - _mayor_cache["t"] < 60:
+        return _mayor_cache["data"]
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        data = await get_json(session, "/resources/skyblock/election")
+    _mayor_cache.update(t=time.time(), data=data)
+    return data
+
+
+def perk_lines(perks):
+    return "\n".join(f"**{_clean(p.get('name'))}** — {_clean(p.get('description'))}"
+                     for p in perks or []) or "—"
+
+
+@bot.tree.command(name="mayor", description="Show the current SkyBlock mayor, minister, and any ongoing election")
+async def mayor_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        data = await fetch_election()
+    except Exception as e:
+        print("mayor lookup failed:", repr(e))
+        await interaction.followup.send("❌ Couldn't reach the Hypixel API. Try again in a minute.")
+        return
+
+    mayor = data.get("mayor") or {}
+    embed = discord.Embed(title=f"Mayor {mayor.get('name', 'unknown')}", color=discord.Color.gold())
+    election_year = (mayor.get("election") or {}).get("year")
+    if election_year:
+        embed.description = f"Elected in year {election_year}"
+    embed.add_field(name="Perks", value=perk_lines(mayor.get("perks"))[:1024], inline=False)
+
+    minister = mayor.get("minister")
+    if minister:
+        perk = minister.get("perk") or {}
+        embed.add_field(
+            name=f"Minister {minister.get('name', '')}",
+            value=f"**{_clean(perk.get('name'))}** — {_clean(perk.get('description'))}"[:1024],
+            inline=False)
+
+    current = data.get("current")
+    if current and current.get("candidates"):
+        cands = sorted(current["candidates"], key=lambda c: c.get("votes", 0), reverse=True)
+        total = sum(c.get("votes", 0) for c in cands) or 1
+        lines = [f"**{c.get('name')}** — {c.get('votes', 0):,} votes "
+                 f"({c.get('votes', 0) / total:.0%})" for c in cands]
+        embed.add_field(name=f"🗳️ Election in progress (year {current.get('year')})",
+                        value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text="Data: Hypixel API")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -382,7 +500,9 @@ async def on_ready():
     if channel is None:
         print("Can't see the channel: check CHANNEL_ID and the bot's permissions")
         return
-    await channel.send("✅ SkyBlock tracker online")
+    if not bot.announced:  # on_ready can fire again after a reconnect
+        bot.announced = True
+        await channel.send("✅ SkyBlock tracker online")
     if not poll.is_running():
         poll.start()
 
